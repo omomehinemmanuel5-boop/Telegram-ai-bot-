@@ -1,281 +1,146 @@
+# Bot.py
+# Telegram bot (OpenAI only) — python-telegram-bot v21 (async)
+
 import os
-import base64
-from typing import List, Dict, Optional
+import logging
+from typing import List, Dict
 
-from telegram import (
-    Update,
-    InlineQueryResultArticle,
-    InputTextMessageContent,
-)
+from telegram import Update
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    InlineQueryHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
 
+# ---- OpenAI (Responses API) ----
 from openai import OpenAI
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# ==============================
-# ENV + CLIENT
-# ==============================
+# ---- Config / State ----
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not TELEGRAM_TOKEN or not os.getenv("OPENAI_API_KEY"):
+    raise ValueError("Missing TELEGRAM_TOKEN or OPENAI_API_KEY")
 
-if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
-    raise ValueError("Missing API keys! Set TELEGRAM_TOKEN and OPENAI_API_KEY")
+DEFAULT_SYSTEM = "You are a helpful AI assistant in Telegram. Be concise and friendly."
+DEFAULT_MODEL  = "gpt-4.1-mini"  # change to gpt-4.1 or o4-mini if you have access
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# in-memory state (good enough for personal bot)
+HISTORY: Dict[int, List[Dict[str, str]]] = {}
+SETTINGS: Dict[int, Dict[str, str]] = {}
+STATS:    Dict[int, Dict[str, int]] = {}
 
-# ==============================
-# STATE
-# ==============================
-conversation_history: Dict[int, List[Dict]] = {}
-user_settings: Dict[int, Dict] = {}
-usage_stats: Dict[int, Dict] = {}
-
-DEFAULT_SYSTEM_PROMPT = "You are a helpful AI assistant in Telegram. Be concise and friendly."
-DEFAULT_MODEL = "gpt-4o-mini"  # works for text + vision. You can switch to gpt-4o if you have access.
-
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("lex-telegram")
 
 def init_user(user_id: int):
-    if user_id not in conversation_history:
-        conversation_history[user_id] = []
-    if user_id not in user_settings:
-        user_settings[user_id] = {"system_prompt": DEFAULT_SYSTEM_PROMPT, "model": DEFAULT_MODEL}
-    if user_id not in usage_stats:
-        usage_stats[user_id] = {"messages": 0, "tokens": 0}
+    HISTORY.setdefault(user_id, [])
+    SETTINGS.setdefault(user_id, {"system": DEFAULT_SYSTEM, "model": DEFAULT_MODEL})
+    STATS.setdefault(user_id, {"messages": 0, "in": 0, "out": 0})
 
-# ==============================
-# LLM HELPER (OpenAI only)
-# ==============================
-async def llm_reply_openai(
-    messages: List[Dict],
-    system_prompt: Optional[str] = None,
-    image_base64: Optional[str] = None,
-    image_mime: str = "image/jpeg",
-    max_tokens: int = 700,
-):
-    """
-    messages: list of {"role": "user"/"assistant", "content": "text"}
-    image_base64: if provided, attaches a single image to the last user message
-    """
-    system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
-    oai_messages: List[Dict] = [{"role": "system", "content": system_prompt}]
+# ---- LLM helper (OpenAI Responses API) ----
+async def llm_reply(messages: List[Dict[str, str]], system: str, max_tokens: int = 800):
+    # Pack conversation into a single user message (simple + works with Responses API)
+    transcript = [f"[{m['role'].capitalize()}]\n{m['content']}" for m in messages]
+    prompt = f"[System]\n{system}\n\n" + "\n\n".join(transcript)
 
-    # copy text messages first
-    for m in messages:
-        oai_messages.append({"role": m["role"], "content": m["content"]})
-
-    # If an image is provided, attach as content parts to the last user message
-    if image_base64:
-        # ensure last message is a user message; if not, create one
-        if not oai_messages or oai_messages[-1]["role"] != "user":
-            oai_messages.append({"role": "user", "content": ""})
-
-        last = oai_messages[-1]
-        text_part = {"type": "text", "text": last["content"] or "Describe this image."}
-        data_url = f"data:{image_mime};base64,{image_base64}"
-        image_part = {"type": "image_url", "image_url": {"url": data_url}}
-
-        last["content"] = [text_part, image_part]
-
-    resp = client.chat.completions.create(
-        model=DEFAULT_MODEL,
-        messages=oai_messages,
-        max_tokens=max_tokens,
-        temperature=0.4,
+    resp = openai_client.responses.create(
+        model=SETTINGS[messages and 0 or 0 if False else list(SETTINGS.values())[0]]["model"]
+        if SETTINGS else DEFAULT_MODEL,
+        input=[{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+        max_output_tokens=max_tokens,
     )
 
-    text = resp.choices[0].message.content or ""
-    used_in = getattr(resp.usage, "prompt_tokens", 0)
-    used_out = getattr(resp.usage, "completion_tokens", 0)
-    return text, used_in, used_out
+    text = ""
+    if resp.output and hasattr(resp.output[0], "content"):
+        for chunk in resp.output[0].content:
+            if chunk["type"] == "output_text":
+                text += chunk["text"]
 
+    usage = getattr(resp, "usage", {}) or {}
+    return text or "I couldn't generate a reply.", usage.get("input_tokens", 0), usage.get("output_tokens", 0)
 
-# ==============================
-# COMMANDS
-# ==============================
+# ---- Commands ----
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     init_user(user_id)
-    welcome = (
-        "🚀 *Your AI Assistant is Ready!*\n\n"
-        "I can help with:\n"
-        "• Conversations\n"
-        "• Image analysis\n"
-        "• Inline mode\n\n"
-        "*Commands:*\n"
-        "/start – This message\n"
-        "/reset – Clear history\n"
-        "/system <text> – Custom personality\n"
-        "/stats – Usage stats\n"
-        "/help – Detailed help"
+    msg = (
+        "🚀 *Lex OpenAI Telegram Bot*\n\n"
+        "Commands:\n"
+        "/start – help message\n"
+        "/reset – clear history\n"
+        "/system <text> – set personality\n"
+        "/stats – usage\n"
+        "/help – tips"
     )
-    await update.message.reply_text(welcome, parse_mode="Markdown")
-
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    conversation_history[user_id] = []
-    await update.message.reply_text("🔄 History cleared!")
+    HISTORY[user_id] = []
+    await update.message.reply_text("🔄 History cleared.")
 
-
-async def set_system_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def set_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     init_user(user_id)
     if context.args:
-        custom = " ".join(context.args)
-        user_settings[user_id]["system_prompt"] = custom
-        await update.message.reply_text(f"✅ Personality set!\n\n_{custom}_", parse_mode="Markdown")
+        SETTINGS[user_id]["system"] = " ".join(context.args)
+        await update.message.reply_text("✅ System prompt updated.")
     else:
-        current = user_settings[user_id]["system_prompt"]
-        await update.message.reply_text(
-            f"*Current:*\n_{current}_\n\nChange: `/system your text`",
-            parse_mode="Markdown"
-        )
-
+        await update.message.reply_text(f"*Current:*\n{SETTINGS[user_id]['system']}", parse_mode="Markdown")
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     init_user(user_id)
-    s = usage_stats[user_id]
-    msg = (
-        "📊 *Stats*\n\n"
-        f"Messages: {s.get('messages', 0)}\n"
-        f"Tokens: ~{s.get('tokens', 0)}\n"
-        f"History turns: {len(conversation_history[user_id])}"
+    s = STATS[user_id]
+    await update.message.reply_text(
+        f"📊 Stats\nMessages: {s['messages']}\nTokens in: {s['in']}\nTokens out: {s['out']}"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
 
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "🤖 *Help Guide*\n\n"
-        "*Text:* Just chat naturally.\n"
-        "*Images:* Send a photo for analysis.\n"
-        "*Inline mode:* In any chat, type `@YourBotName question`.\n\n"
-        "*Tips:*\n"
-        "• Be specific\n"
-        "• I remember short context\n"
-        "• Use /reset to change topics"
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 Tips:\n• Be specific\n• I remember context\n• Use /reset to change topics"
     )
-    await update.message.reply_text(help_text, parse_mode="Markdown")
 
-
-# ==============================
-# HANDLERS
-# ==============================
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---- Text handler ----
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     init_user(user_id)
-    await update.message.chat.send_action("typing")
+    user_text = update.message.text
+
+    HISTORY[user_id].append({"role": "user", "content": user_text})
 
     try:
-        photo = update.message.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
-        photo_bytes = await file.download_as_bytearray()
-        photo_base64 = base64.b64encode(photo_bytes).decode("utf-8")
-        caption = update.message.caption or "What’s in this image?"
-
-        # We keep the convo short for vision
-        vision_messages = [{"role": "user", "content": caption}]
-
-        answer, used_in, used_out = await llm_reply_openai(
-            messages=vision_messages,
-            system_prompt=user_settings[user_id]["system_prompt"],
-            image_base64=photo_base64,
-            max_tokens=600
+        answer, used_in, used_out = await llm_reply(
+            HISTORY[user_id], SETTINGS[user_id]["system"], max_tokens=800
         )
+        HISTORY[user_id].append({"role": "assistant", "content": answer})
 
-        conversation_history[user_id].append({"role": "user", "content": f"[Image] {caption}"})
-        conversation_history[user_id].append({"role": "assistant", "content": answer})
-        usage_stats[user_id]["messages"] += 1
-        usage_stats[user_id]["tokens"] += (used_in + used_out)
+        # keep last 40 turns to control cost
+        if len(HISTORY[user_id]) > 80:
+            HISTORY[user_id] = HISTORY[user_id][-80:]
+
+        # stats
+        STATS[user_id]["messages"] += 1
+        STATS[user_id]["in"] += used_in
+        STATS[user_id]["out"] += used_out
 
         await update.message.reply_text(answer)
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Error: {str(e)}")
+        log.exception("Reply error")
+        await update.message.reply_text(f"⚠️ Error: {e}")
 
-
-async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.inline_query.query
-    if not query:
-        return
-    try:
-        answer, _, _ = await llm_reply_openai(
-            messages=[{"role": "user", "content": query}],
-            system_prompt=DEFAULT_SYSTEM_PROMPT,
-            max_tokens=220
-        )
-
-        results = [
-            InlineQueryResultArticle(
-                id="1",
-                title="Answer",
-                input_message_content=InputTextMessageContent(
-                    message_text=f"❓ *{query}*\n\n{answer}",
-                    parse_mode="Markdown"
-                ),
-                description=(answer[:100] + "…") if len(answer) > 100 else answer,
-            )
-        ]
-        await update.inline_query.answer(results, cache_time=300)
-    except Exception as _:
-        # swallow inline errors quietly (Telegram UX)
-        return
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_message = update.message.text or ""
-    init_user(user_id)
-
-    conversation_history[user_id].append({"role": "user", "content": user_message})
-    await update.message.chat.send_action("typing")
-
-    try:
-        answer, used_in, used_out = await llm_reply_openai(
-            messages=conversation_history[user_id],
-            system_prompt=user_settings[user_id]["system_prompt"],
-            max_tokens=700
-        )
-
-        conversation_history[user_id].append({"role": "assistant", "content": answer})
-        usage_stats[user_id]["messages"] += 1
-        usage_stats[user_id]["tokens"] += (used_in + used_out)
-
-        # Trim history to last 50 turns to keep tokens low
-        if len(conversation_history[user_id]) > 50:
-            conversation_history[user_id] = conversation_history[user_id][-50:]
-
-        await update.message.reply_text(answer)
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Error: {str(e)}")
-
-
-# ==============================
-# MAIN
-# ==============================
+# ---- Main ----
 def main():
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("reset", reset))
-    application.add_handler(CommandHandler("system", set_system_prompt))
-    application.add_handler(CommandHandler("stats", stats))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(InlineQueryHandler(handle_inline_query))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("system", set_system))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("help", help_cmd))
 
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_handler(MessageHandler(filters.Document.ALL, lambda u, c: u.message.reply_text("📎 PDF upload not supported in OpenAI-only mode yet. Send text or images.")))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    print("🚀 Bot is running!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
+    print("🚀 Bot is running (polling)…")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
